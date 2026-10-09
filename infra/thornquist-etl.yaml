@@ -1,0 +1,156 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Thornquist Outfitters - third stack. The raw-to-trusted Glue ETL job for POS data,
+  a bucket for the job's script, and a Glue database plus crawler for the trusted zone.
+  Deploy AFTER the buckets stack. Creates NO IAM roles: the job and crawler use LabRole.
+
+Parameters:
+  Suffix:
+    Type: String
+    Description: The SAME suffix you used in the buckets stack.
+    AllowedPattern: "^[a-z0-9]{2,12}$"
+    ConstraintDescription: Lowercase letters and digits only, 2-12 characters.
+
+  LabRoleArn:
+    Type: String
+    Description: ARN of the pre-built lab role, e.g. arn:aws:iam::123456789012:role/LabRole
+    AllowedPattern: "^arn:aws:iam::[0-9]{12}:role/.+$"
+
+  TrustedDatabaseName:
+    Type: String
+    Default: thornquist_trusted
+    AllowedPattern: "^[a-z0-9_]{1,64}$"
+    Description: Name of the Glue database holding the trusted-zone tables.
+
+  GlueVersion:
+    Type: String
+    Default: "5.0"
+    AllowedValues: ["4.0", "5.0"]
+    Description: Glue runtime. 5.0 uses Spark 3.5. Switch to 4.0 only if 5.0 is unavailable in your lab.
+
+  NumberOfWorkers:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 5
+    Description: >
+      Spark workers (G.1X, 1 DPU each). 2 is the minimum and plenty for this data.
+      Glue bills by the second, so a short run costs only a few cents of lab budget.
+
+  JobTimeoutMinutes:
+    Type: Number
+    Default: 15
+    MinValue: 5
+    MaxValue: 120
+    Description: The job is stopped after this long, so a stuck run cannot keep spending budget.
+
+  ScriptKey:
+    Type: String
+    Default: glue/raw_to_trusted_pos.py
+    Description: Where the script is stored in the scripts bucket. You upload it there after this stack is created.
+
+Resources:
+  # ---------------------------------------------------------------- SCRIPT STORE
+  ScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "thornquist-scripts-${Suffix}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - { Key: Project, Value: thornquist }
+        - { Key: Purpose, Value: glue-scripts }
+
+  # ----------------------------------------------------------------- GLUE JOB
+  RawToTrustedPosJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "thornquist-raw-to-trusted-pos-${Suffix}"
+      Description: >
+        Reads the raw POS CSVs, conforms them to the shared sales schema (dates, customer ID,
+        SKU, price and quantity types) and writes partitioned Parquet to the trusted bucket.
+        It does not drop or fix bad records; unparseable values become NULL and are listed
+        in the parse_errors column for the data quality gate.
+      Role: !Ref LabRoleArn
+      GlueVersion: !Ref GlueVersion
+      WorkerType: G.1X
+      NumberOfWorkers: !Ref NumberOfWorkers
+      Timeout: !Ref JobTimeoutMinutes
+      MaxRetries: 0
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ScriptsBucket}/${ScriptKey}"
+      DefaultArguments:
+        "--job-language": python
+        "--RAW_BUCKET": !Sub "thornquist-raw-${Suffix}"
+        "--TRUSTED_BUCKET": !Sub "thornquist-trusted-${Suffix}"
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--job-bookmark-option": job-bookmark-disable
+      Tags:
+        Project: thornquist
+
+  # ------------------------------------------------------------- TRUSTED CATALOG
+  TrustedDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref TrustedDatabaseName
+        Description: Thornquist trusted zone. Conformed, typed tables.
+
+  # Crawls only sales_conformed/ for now. When the data quality gate starts writing
+  # its passed records to sales/ (and rejected ones to a quarantine folder), add
+  # those folders as extra targets here.
+  TrustedCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "thornquist-trusted-${Suffix}"
+      Description: Registers the conformed sales Parquet as the table sales_conformed, partitioned by dt.
+      Role: !Ref LabRoleArn
+      DatabaseName: !Ref TrustedDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://thornquist-trusted-${Suffix}/sales_conformed/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "Grouping": { "TableGroupingPolicy": "CombineCompatibleSchemas" },
+          "CrawlerOutput": { "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" } }
+        }
+      Tags:
+        Project: thornquist
+
+Outputs:
+  ScriptsBucketName:
+    Value: !Ref ScriptsBucket
+  UploadScriptCommand:
+    Description: Run this from the repo folder to put the job script in place before starting the job.
+    Value: !Sub "aws s3 cp glue/raw_to_trusted_pos.py s3://${ScriptsBucket}/${ScriptKey}"
+  GlueJobName:
+    Value: !Ref RawToTrustedPosJob
+  TrustedDatabaseName:
+    Value: !Ref TrustedDatabase
+  TrustedCrawlerName:
+    Value: !Ref TrustedCrawler
