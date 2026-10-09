@@ -1,0 +1,400 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Thornquist Outfitters data lake - four-zone S3 layout
+  (landing -> raw -> trusted -> curated) plus the landing-to-raw promotion
+  Lambda. Designed for AWS Academy Learner Lab: it creates NO IAM roles and
+  refers to the existing LabRole by ARN.
+
+Parameters:
+  Suffix:
+    Type: String
+    Description: Short unique suffix (e.g. your initials) so bucket names are globally unique.
+    AllowedPattern: "^[a-z0-9]{2,12}$"
+    ConstraintDescription: Lowercase letters and digits only, 2-12 characters.
+
+  LabRoleArn:
+    Type: String
+    Description: ARN of the pre-built lab role, e.g. arn:aws:iam::123456789012:role/LabRole
+    AllowedPattern: "^arn:aws:iam::[0-9]{12}:role/.+$"
+
+  EnableZoneLockdown:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      If true, landing and raw deny every principal except LabRole (and the
+      optional AdminPrincipalArn below). Leave false until everything works.
+
+  AdminPrincipalArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:aws:iam::[0-9]{12}:role/.+$"
+    Description: >
+      Only used when EnableZoneLockdown is true. The role YOUR lab login uses,
+      so you can still upload and edit the bucket policy. Run
+      "aws sts get-caller-identity", and turn the assumed-role ARN into a role ARN:
+      arn:aws:sts::111122223333:assumed-role/voclabs/user123 becomes
+      arn:aws:iam::111122223333:role/voclabs. Leave empty if lockdown stays off.
+
+  NoncurrentVersionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Days before old object versions are deleted (keeps storage cost down).
+
+  PosExpectedHeader:
+    Type: String
+    Default: "txn_id,store_id,province,txn_date,sku,product_name,category,quantity,unit_price,payment_type,loyalty_id"
+    Description: >
+      The exact POS CSV header row. A file whose first line differs is sent to
+      quarantine. Change this (not the code) if your POS columns change.
+
+Conditions:
+  LockdownEnabled: !Equals [!Ref EnableZoneLockdown, "true"]
+  HasAdmin: !Not [!Equals [!Ref AdminPrincipalArn, ""]]
+
+Resources:
+  # ------------------------------------------------- LANDING -> RAW PROMOTION
+  PromoteLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/thornquist-landing-to-raw-${Suffix}"
+      RetentionInDays: 14
+
+  PromoteFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PromoteLogGroup
+    Properties:
+      FunctionName: !Sub "thornquist-landing-to-raw-${Suffix}"
+      Description: Checks files arriving in landing and promotes them to raw, or quarantines them.
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Ref LabRoleArn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          RAW_BUCKET: !Sub "thornquist-raw-${Suffix}"
+          EXPECTED_HEADER: !Ref PosExpectedHeader
+      Code:
+        ZipFile: |
+          import codecs
+          import logging
+          import os
+          import urllib.parse
+
+          import boto3
+
+          # Landing -> raw promotion. Copies good files unchanged to the raw bucket,
+          # sends bad ones to quarantine/ with the reason attached.
+          s3 = boto3.client("s3")
+          RAW = os.environ["RAW_BUCKET"]
+          EXPECTED = os.environ["EXPECTED_HEADER"].split(",")
+          CHUNK = 65536
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+
+
+          def check(bucket, key, version):
+              """Return None if the file looks fine, otherwise a short reason."""
+              args = {"Bucket": bucket, "Key": key}
+              if version:
+                  args["VersionId"] = version
+              size = s3.head_object(**args)["ContentLength"]
+              if size == 0:
+                  return "file is empty"
+              # Only the first 64 KB is needed to judge the header and first data row.
+              rng = "bytes=0-%d" % (CHUNK - 1)
+              body = s3.get_object(Range=rng, **args)["Body"].read()
+              try:
+                  dec = codecs.getincrementaldecoder("utf-8-sig")()
+                  text = dec.decode(body, final=size <= CHUNK)
+              except UnicodeDecodeError:
+                  return "not valid UTF-8 text"
+              lines = text.split("\n")
+              first = lines[0].strip()
+              if not first:
+                  return "no header row"
+              if [c.strip() for c in first.split(",")] != EXPECTED:
+                  return "unexpected header: " + first[:80]
+              if not any(x.strip() for x in lines[1:]):
+                  return "header only, no data rows"
+              return None
+
+
+          def handler(event, context):
+              for rec in event["Records"]:
+                  obj = rec["s3"]["object"]
+                  bucket = rec["s3"]["bucket"]["name"]
+                  # S3 URL-encodes keys in events (dt=2026-09-17 arrives as dt%3D2026-09-17).
+                  key = urllib.parse.unquote_plus(obj["key"])
+                  version = obj.get("versionId")
+                  problem = check(bucket, key, version)
+                  src = {"Bucket": bucket, "Key": key}
+                  if version:
+                      src["VersionId"] = version
+                  if problem is None:
+                      s3.copy_object(CopySource=src, Bucket=RAW, Key=key)
+                      log.info("PROMOTED  %s", key)
+                  else:
+                      reason = "".join(c if 32 <= ord(c) < 127 else "?" for c in problem)
+                      s3.copy_object(
+                          CopySource=src, Bucket=RAW, Key="quarantine/" + key,
+                          Metadata={"reject-reason": reason},
+                          MetadataDirective="REPLACE", ContentType="text/csv",
+                      )
+                      log.warning("QUARANTINED  %s  reason: %s", key, problem)
+      Tags:
+        - { Key: Project, Value: thornquist }
+
+  # Lets S3 call the function. The bucket ARN is written out (not looked up with
+  # GetAtt) so the bucket and this permission do not depend on each other in a loop.
+  PromoteFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PromoteFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:aws:s3:::thornquist-landing-${Suffix}"
+
+  # ---------------------------------------------------------------- LANDING
+  LandingBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: PromoteFunctionPermission
+    Properties:
+      BucketName: !Sub "thornquist-landing-${Suffix}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionDays
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt PromoteFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - { Name: prefix, Value: "pos/" }
+                  - { Name: suffix, Value: ".csv" }
+      Tags:
+        - { Key: Project, Value: thornquist }
+        - { Key: Zone, Value: landing }
+
+  LandingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LandingBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt LandingBucket.Arn
+              - !Sub "${LandingBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+          - !If
+            - LockdownEnabled
+            - Sid: DenyEveryoneExceptIngestionRole
+              Effect: Deny
+              Principal: "*"
+              Action: "s3:*"
+              Resource:
+                - !GetAtt LandingBucket.Arn
+                - !Sub "${LandingBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  "aws:PrincipalArn": !If
+                    - HasAdmin
+                    - [!Ref LabRoleArn, !Ref AdminPrincipalArn]
+                    - [!Ref LabRoleArn]
+            - !Ref AWS::NoValue
+
+  # -------------------------------------------------------------------- RAW
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "thornquist-raw-${Suffix}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionDays
+      Tags:
+        - { Key: Project, Value: thornquist }
+        - { Key: Zone, Value: raw }
+
+  RawBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt RawBucket.Arn
+              - !Sub "${RawBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+          - !If
+            - LockdownEnabled
+            - Sid: DenyEveryoneExceptIngestionRole
+              Effect: Deny
+              Principal: "*"
+              Action: "s3:*"
+              Resource:
+                - !GetAtt RawBucket.Arn
+                - !Sub "${RawBucket.Arn}/*"
+              Condition:
+                StringNotEquals:
+                  "aws:PrincipalArn": !If
+                    - HasAdmin
+                    - [!Ref LabRoleArn, !Ref AdminPrincipalArn]
+                    - [!Ref LabRoleArn]
+            - !Ref AWS::NoValue
+
+  # ---------------------------------------------------------------- TRUSTED
+  TrustedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "thornquist-trusted-${Suffix}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionDays
+      Tags:
+        - { Key: Project, Value: thornquist }
+        - { Key: Zone, Value: trusted }
+
+  TrustedBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrustedBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt TrustedBucket.Arn
+              - !Sub "${TrustedBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # ---------------------------------------------------------------- CURATED
+  # Analyst access to this zone is handled with Lake Formation permissions
+  # (see the governance package), not with a bucket policy.
+  CuratedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "thornquist-curated-${Suffix}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionDays
+      Tags:
+        - { Key: Project, Value: thornquist }
+        - { Key: Zone, Value: curated }
+
+  CuratedBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CuratedBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt CuratedBucket.Arn
+              - !Sub "${CuratedBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+Outputs:
+  LandingBucketName:
+    Value: !Ref LandingBucket
+  RawBucketName:
+    Value: !Ref RawBucket
+  TrustedBucketName:
+    Value: !Ref TrustedBucket
+  CuratedBucketName:
+    Value: !Ref CuratedBucket
+  LandingBucketArn:
+    Value: !GetAtt LandingBucket.Arn
+  RawBucketArn:
+    Value: !GetAtt RawBucket.Arn
+  TrustedBucketArn:
+    Value: !GetAtt TrustedBucket.Arn
+  CuratedBucketArn:
+    Value: !GetAtt CuratedBucket.Arn
+  PromoteFunctionName:
+    Description: Landing-to-raw Lambda. Its logs are in CloudWatch under /aws/lambda/<this name>.
+    Value: !Ref PromoteFunction

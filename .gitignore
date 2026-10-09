@@ -1,0 +1,6 @@
+credentials
+.aws/
+mock_data/
+thornquist_mock_data.zip
+.DS_Store
+__pycache__/
