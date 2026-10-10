@@ -20,4 +20,4 @@ Rule 4: Duplicate rows
 Column:       sale_id
 Fails when:   two or more rows share the same sale_id
 Action:       quarantine all copies
-Reason:       the 35 POS rows
+Reason:       34 duplicate sale_ids: 69 rows quarantined (35 extra copies)
