@@ -21,3 +21,9 @@ Column:       sale_id
 Fails when:   two or more rows share the same sale_id
 Action:       quarantine all copies
 Reason:       34 duplicate sale_ids: 69 rows quarantined (35 extra copies)
+
+Rule 5: Category present
+Column:       category
+Fails when:   category is NULL, blank, or the placeholder UNKNOWN
+Action:       goes to quarantine
+Reason:       14 POS rows flagged (13 new after overlap with other rules)
