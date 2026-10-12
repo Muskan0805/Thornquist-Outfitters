@@ -279,5 +279,5 @@ to reconcile:
 
 ## Team
 
-- `<name>`: ingestion, catalog, raw to trusted ETL
-- `<name>`: data quality gate, curated layer, governance, dashboard
+- `Muskan`: ingestion, catalog, raw to trusted ETL
+- `David Beharry`: data quality gate, curated layer, governance, dashboard
