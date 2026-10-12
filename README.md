@@ -8,13 +8,14 @@ personal data is used anywhere.
 
 ## Architecture
 
-![Architecture v1](docs/thornquist-architecture-v1.png)
+![Architecture v2](docs/thornquist-architecture-v2.png)
 
-Flow: sources, S3 landing, a validation Lambda, S3 raw, a Glue ETL job that conforms
+Flow: three sources, three ingestion mechanisms (a script, an S3-triggered Lambda and a
+scheduled Glue job), S3 landing, a validation Lambda, S3 raw, Glue ETL jobs that conform
 the schema, S3 trusted, a data quality gate, a Glue ETL job that aggregates, S3 curated
-(Parquet), then Athena and a dashboard. Glue crawlers register each zone in the Glue
-Data Catalog. Solid boxes in the diagram are built and tested; dashed boxes are planned.
-An editable copy is in `docs/thornquist-architecture-v1.drawio`.
+(Parquet), then Athena and a dashboard. Glue crawlers and hand-written tables register
+the zones in the Glue Data Catalog. Solid boxes in the diagram are built and tested; dashed boxes are planned.
+An editable copy is in `docs/thornquist-architecture-v2.drawio`.
 
 ## Status
 
@@ -22,13 +23,13 @@ An editable copy is in `docs/thornquist-architecture-v1.drawio`.
 |---|---|
 | Four S3 zones, versioning, encryption, public access blocked (IaC) | Built, tested |
 | Scripted POS upload to landing | Built, tested |
-| Landing to raw promotion Lambda, with quarantine | Built, tested |
+| Landing to raw promotion Lambda (POS, e-commerce, customers), with quarantine | Built, tested |
 | Glue database, crawler and Athena workgroup for raw POS | Built, tested |
-| Raw to trusted Glue ETL for POS (schema conformance) | Built, tested |
-| Trusted database and crawler (`sales_conformed`) | Built, tested |
-| E-commerce JSON ingestion (Lambda) and hand-written table definition | Planned |
-| Customer extract ingestion (scheduled Glue job) | Planned |
-| Raw to trusted ETL for e-commerce and customers | Planned |
+| E-commerce ingestion: Lambda trigger plus hand-written `raw_ecommerce` table (nested JSON) | Built, tested locally; deploy to confirm |
+| Customer extract ingestion: hand-written `raw_customers` table plus weekly scheduled Glue job | Built, tested locally; deploy to confirm |
+| Raw to trusted Glue ETL for sales (POS and e-commerce, `sales_conformed`) | POS built and run in AWS; e-commerce tested locally |
+| Raw to trusted Glue ETL for customers (`customers_conformed`) | Built, tested locally; deploy to confirm |
+| Trusted database and crawler | Built, tested |
 | Data quality gate with quarantine | Planned |
 | Curated Parquet table, five Athena queries, dashboard | Planned |
 | Governance package (IAM policy JSON, bucket policy, Lake Formation) | Planned |
@@ -37,16 +38,17 @@ An editable copy is in `docs/thornquist-architecture-v1.drawio`.
 
 ```
 docs/
-  thornquist-architecture-v1.png     Architecture diagram (also .svg and editable .drawio)
+  thornquist-architecture-v2.png     Architecture diagram (also .svg and editable .drawio)
 infra/
-  thornquist-buckets.yaml            Stack 1: four zone buckets + landing-to-raw Lambda and trigger
-  thornquist-glue-athena.yaml        Stack 2: Glue database, CSV classifier, raw crawler, Athena workgroup
-  thornquist-etl.yaml                Stack 3: scripts bucket, raw-to-trusted Glue job, trusted database and crawler
+  thornquist-buckets.yaml            Stack 1: four zone buckets + landing-to-raw Lambda and its triggers
+  thornquist-glue-athena.yaml        Stack 2: Glue database, raw POS crawler, raw e-commerce and customer tables, Athena workgroup
+  thornquist-etl.yaml                Stack 3: scripts bucket, sales and customer Glue jobs, weekly schedule, trusted database and crawler
 glue/
-  raw_to_trusted_pos.py              PySpark job: raw POS CSV to conformed sales Parquet
+  raw_to_trusted_sales.py            PySpark job: raw POS CSV + e-commerce JSON to conformed sales Parquet
+  raw_to_trusted_customers.py        PySpark job: latest raw customer snapshot to conformed customers Parquet
 scripts/
   generate_mock_data.py              Creates the synthetic POS, e-commerce and customer files
-  pos_upload.py                      Uploads POS CSVs to landing (ingestion mechanism 1)
+  pos_upload.py                      Uploads files to landing: POS CSV (default), e-commerce JSON (--format json), customer extract (--format psv)
 ```
 
 ## Zone design and promotion rules
@@ -55,12 +57,16 @@ scripts/
 |---|---|---|---|
 | Landing | `thornquist-landing-<suffix>` | Files exactly as they arrive | A source delivers a file |
 | Raw | `thornquist-raw-<suffix>` | Accepted files, byte-for-byte unchanged | The file opens, is not empty, has the expected header and at least one data row |
-| Trusted | `thornquist-trusted-<suffix>` | `sales_conformed/`: typed rows in the shared schema. `sales/` and `quarantine/`: planned output of the quality gate | Conformed by the Glue job; promoted to `sales/` only after the quality gate (planned) |
+| Trusted | `thornquist-trusted-<suffix>` | `sales_conformed/` and `customers_conformed/`: typed rows in the shared schema. `sales/` and `quarantine/`: planned output of the quality gate | Conformed by the Glue job; promoted to `sales/` only after the quality gate (planned) |
 | Curated | `thornquist-curated-<suffix>` | Aggregated, partitioned Parquet for analytics | Planned |
 
-Files that fail the landing-to-raw check go to `quarantine/` in the raw bucket
-with the reason stored in the object's `reject-reason` metadata. The crawler only
-reads `pos/`, so quarantined files never become table data.
+The landing-to-raw check depends on the source. POS: CSV with the exact expected header and
+at least one data row. E-commerce: JSON lines whose first line parses and has `orderId` and
+`items`. Customers: pipe-delimited with the expected header and at least one data row. All
+sources: not empty, valid UTF-8. Files that fail go to `quarantine/` in the raw bucket
+with the reason stored in the object's `reject-reason` metadata. Crawlers and tables only
+read the source folders (`pos/`, `ecommerce/`, `customers/`), so quarantined files never
+become table data.
 
 All buckets use versioning (so raw cannot be silently overwritten), AES-256
 encryption, blocked public access, a TLS-only policy, and a lifecycle rule that
@@ -68,32 +74,42 @@ deletes old object versions after 30 days to protect the shared lab budget.
 
 ## Trusted schema (the contract with the quality gate)
 
-The raw to trusted job writes one conformed table, `sales_conformed`, shared by all
-channels. It converts types and formats but never drops, de-duplicates or repairs
+The sales job writes one conformed table, `sales_conformed`, shared by all
+channels (`store` from POS, `web` and `app` from e-commerce). It converts types and formats but never drops, de-duplicates or repairs
 records. A value that cannot be converted becomes NULL and its column name is listed in
 `parse_errors`. The quality gate reads this table, applies its rules, writes passing rows
 to `sales/` and rejected rows to a quarantine folder.
 
 | Column | Type | Notes |
 |---|---|---|
-| `sale_id` | string | POS `txn_id` (e-commerce: order ID plus line number, planned) |
-| `channel` | string | `store`, `web` or `app` |
-| `sale_date` | date | NULL if the source date is invalid |
-| `customer_id` | string | 6 digits, no prefix; NULL for walk-in customers |
+| `sale_id` | string | POS `txn_id`; e-commerce: order ID plus line number (`EC-100001-1`) |
+| `channel` | string | `store` (POS), `web` or `app` (e-commerce) |
+| `sale_date` | date | NULL if the source date is invalid; e-commerce uses the local date in the timestamp |
+| `customer_id` | string | 6 digits, no prefix; NULL for walk-in (POS) and guest (e-commerce) customers |
 | `sku` | string | `TH-<digits>` |
 | `product_name` | string | |
-| `category` | string | Blank becomes NULL; placeholders such as `UNKNOWN` are kept for the gate |
+| `category` | string | POS-style list (Camping, Apparel, Footwear, Accessories, Packs); e-commerce paths are mapped by top level; blank becomes NULL; placeholders such as `UNKNOWN` are kept for the gate |
 | `quantity` | int | NULL if not numeric; zero and negative values are kept for the gate |
-| `unit_price_cad` | decimal(10,2) | NULL if not numeric; zero and negative values are kept for the gate |
-| `province` | string | Two-letter code |
-| `store_id` | string | |
+| `unit_price_cad` | decimal(10,2) | In CAD. E-commerce cents become dollars and USD orders are converted at a fixed rate (`UsdToCad` parameter, default 1.35). NULL if not numeric or the currency is unknown; zero and negative values are kept for the gate |
+| `province` | string | Two-letter code (e-commerce: shipping province; `UNKNOWN` placeholders kept for the gate) |
+| `store_id` | string | NULL for e-commerce |
 | `parse_errors` | string | Comma-separated names of columns that could not be converted; NULL when clean |
 | `source_file` | string | Raw file the row came from |
 | `ingested_at` | timestamp | |
 | `dt` | string | Partition: the landing date folder |
 
 The job reads all of raw on every run and overwrites its output, so running it twice
-gives the same result.
+gives the same result. An order with no items still produces one row (with NULL item fields),
+and a line that is not valid JSON is skipped and counted in the job log, the only case where
+the job leaves a line out.
+
+The customers job writes `customers_conformed` from the latest weekly snapshot only (the
+extract is a full dump, so the newest file is the current state). Columns: `customer_id`,
+`first_name`, `last_name`, `email`, `signup_date` (date), `province` (two-letter code),
+`segment_code`, `opt_in` (boolean), `parse_errors`, `snapshot_date`, `source_file`,
+`ingested_at`. Repeated customer rows, `N/A` emails, `UNKNOWN` last names and the placeholder
+signup date `01-JAN-00` pass through for the gate; the `99-DEC-99` date is not a real date, so
+it becomes NULL and is listed in `parse_errors`.
 
 ## Learner Lab constraints and how the design handles them
 
@@ -131,12 +147,14 @@ CloudFormation console: **Create stack, With new resources**, upload
 `Suffix` and `LabRoleArn`. Leave the other parameters at their defaults.
 Wait for `CREATE_COMPLETE`.
 
-### 2. Generate and upload the POS data
+### 2. Generate the mock data and upload all three sources
 
 ```
 python3 scripts/generate_mock_data.py --out mock_data
 python3 scripts/pos_upload.py --bucket thornquist-landing-<suffix> --source-dir mock_data/pos --region us-east-1 --dry-run
 python3 scripts/pos_upload.py --bucket thornquist-landing-<suffix> --source-dir mock_data/pos --region us-east-1
+python3 scripts/pos_upload.py --bucket thornquist-landing-<suffix> --source-dir mock_data/ecommerce --format json --region us-east-1
+python3 scripts/pos_upload.py --bucket thornquist-landing-<suffix> --source-dir mock_data/customers --format psv --region us-east-1
 ```
 
 The generator is seeded, so everyone gets identical files. `mock_data/_INJECTED_ISSUES.txt`
@@ -151,9 +169,10 @@ aws s3 cp mock_data/pos/pos_2026-10-02.csv s3://thornquist-landing-<suffix>/pos/
 
 ### 3. Check promotion
 
-After about 30 seconds, `thornquist-raw-<suffix>/pos/` should hold 14 dated
-folders and `quarantine/pos/` should hold the 2 rejected files. Logs are in
-CloudWatch under `/aws/lambda/thornquist-landing-to-raw-<suffix>`.
+After about 30 seconds, `thornquist-raw-<suffix>` should hold `pos/` (14 dated folders),
+`ecommerce/` (14 dated folders) and `customers/` (2 dated folders), and `quarantine/pos/`
+should hold the 2 rejected files. Logs are in CloudWatch under
+`/aws/lambda/thornquist-landing-to-raw-<suffix>`.
 
 ### 4. Deploy stack 2 (catalog and Athena)
 
@@ -168,35 +187,53 @@ workgroup `thornquist-<suffix>` and database `thornquist_raw`:
 
 ```sql
 SELECT dt, COUNT(*) AS row_count FROM raw_pos GROUP BY dt ORDER BY dt;
+SELECT dt, COUNT(*) AS orders FROM raw_ecommerce GROUP BY dt ORDER BY dt;
+SELECT o.orderid, i.sku, i.qty, i.pricecents
+FROM raw_ecommerce o CROSS JOIN UNNEST(o.items) AS t(i) LIMIT 10;
+SELECT dt, COUNT(*) AS customers FROM raw_customers GROUP BY dt ORDER BY dt;
 ```
 
-### 6. Deploy stack 3 and run the raw to trusted job
+`raw_ecommerce` and `raw_customers` are hand-written tables with partition projection, so
+they need no crawler: they work as soon as the files are in raw. The e-commerce query counts
+1,128 orders in total (the 14 repeated order IDs are deliberate), and `raw_customers` shows
+2 snapshots (479 and 505 rows).
+
+### 6. Deploy stack 3 and run the jobs
 
 Create a third stack from `infra/thornquist-etl.yaml`, named `thornquist-<suffix>-etl`, with
-the same `Suffix` and `LabRoleArn`. Then upload the job script (the exact command is also
-in the stack's **Outputs** tab as `UploadScriptCommand`), start the job, and crawl the result:
+the same `Suffix` and your `LabRoleArn`. The `UsdToCad` parameter (default 1.35) is the fixed
+exchange rate for USD orders. Then upload the two job scripts (the exact command is also in the
+stack's **Outputs** tab as `UploadScriptsCommand`), start both jobs, and crawl the results:
 
 ```
-aws s3 cp glue/raw_to_trusted_pos.py s3://thornquist-scripts-<suffix>/glue/raw_to_trusted_pos.py
-aws glue start-job-run --job-name thornquist-raw-to-trusted-pos-<suffix>
+aws s3 cp glue/raw_to_trusted_sales.py s3://thornquist-scripts-<suffix>/glue/raw_to_trusted_sales.py
+aws s3 cp glue/raw_to_trusted_customers.py s3://thornquist-scripts-<suffix>/glue/raw_to_trusted_customers.py
+aws glue start-job-run --job-name thornquist-raw-to-trusted-sales-<suffix>
+aws glue start-job-run --job-name thornquist-raw-to-trusted-customers-<suffix>
 aws glue start-crawler --name thornquist-trusted-<suffix>
 ```
 
-When the job run shows **Succeeded** (about 1 to 2 minutes), its output log contains
-`Read and wrote 2734 rows`. After the crawler finishes, in Athena choose database
-`thornquist_trusted`:
+Start the crawler after both jobs show **Succeeded** (about 1 to 2 minutes each). The sales
+job's output log contains `Read and wrote 4633 rows`, with `channel store: 2734`,
+`channel app: 974` and `channel web: 925`. The customers job logs `Snapshot used: 2026-09-28`
+and `Read and wrote 505 rows`. The customers job also runs by itself every Monday at 06:00 UTC
+(the `CustomerSchedule` parameter; set `CustomerScheduleEnabled` to `false` to create it switched off).
+In Athena choose database `thornquist_trusted`:
 
 ```sql
-SELECT * FROM sales_conformed LIMIT 10;
+SELECT channel, COUNT(*) AS line_items FROM sales_conformed GROUP BY channel;
 SELECT parse_errors, COUNT(*) AS rows FROM sales_conformed GROUP BY parse_errors;
+SELECT * FROM customers_conformed LIMIT 10;
 ```
 
-With the default mock data this shows 29 rows with `sale_date`, 13 with `unit_price`
-and the rest clean.
+With the default mock data `sales_conformed` has 4,633 rows. The second query shows 51 rows
+with a `sale_date` problem (29 POS, 22 e-commerce), 13 with a `unit_price` problem (POS) and the
+rest clean. `customers_conformed` has 505 rows for 500 distinct customers, 2 of them with a
+`signup_date` problem.
 
 ## Tear down
 
-1. Delete stack `thornquist-<suffix>-etl` (empty the `thornquist-scripts-<suffix>` bucket first).
+1. Delete stack `thornquist-<suffix>-etl` (empty the `thornquist-scripts-<suffix>` bucket first). This also removes the weekly schedule.
 2. Delete stack `thornquist-<suffix>-glue` (empty the `thornquist-athena-results-<suffix>` bucket first).
 3. Empty each of the four zone buckets using the S3 console **Empty** button, which also removes old object versions.
 4. Delete stack `thornquist-<suffix>`.
@@ -210,25 +247,35 @@ to reconcile:
 
 | Field | POS | E-commerce | Customers | Conformed form | Done for |
 |---|---|---|---|---|---|
-| Date | `MM/DD/YYYY` | ISO 8601 with timezone | `DD-MON-YY` | `date`; invalid becomes NULL | POS |
-| Customer ID | `L000123` | integer `123` | `000123` | 6-digit string | POS |
-| Category | `Footwear` | `Shoes > Hiking Boots` | n/a | Shared category list (mapping table planned) | Planned |
-| SKU | `TH-1001` | `TH1001` | n/a | `TH-1001` | POS |
-| Price | dollars as text | integer cents, some USD | n/a | `decimal(10,2)` in CAD | POS (dollars only) |
-| Province | `ON` | `ON` | `Ontario` | Two-letter code | POS |
+| Date | `MM/DD/YYYY` | ISO 8601 with timezone | `DD-MON-YY` | `date`; invalid becomes NULL | POS, e-commerce, customers |
+| Customer ID | `L000123` | integer `123` | `000123` | 6-digit string | POS, e-commerce, customers |
+| Category | `Footwear` | `Shoes > Hiking Boots` | n/a | POS category list (e-commerce top level mapped: Shoes to Footwear, and so on) | POS, e-commerce |
+| SKU | `TH-1001` | `TH1001` | n/a | `TH-1001` | POS, e-commerce |
+| Price | dollars as text | integer cents, some USD | n/a | `decimal(10,2)` in CAD | POS, e-commerce |
+| Province | `ON` | `ON` | `Ontario` | Two-letter code | POS, e-commerce, customers |
 
 ## Known limitations
 
-- The combined stack 1 template (buckets plus Lambda) has been applied as an update to
-  an existing stack and the result tested. A first-time create from an empty account
-  follows the same dependency order, but has not yet been verified end to end.
-- The landing trigger covers `.csv` files under `pos/` only. Other sources will add
-  their own trigger rules.
-- The Lambda requires the exact POS header set by the `PosExpectedHeader` parameter.
-- The Glue job reads only `pos/dt=*/` folders, so files placed in `pos/undated/` are ignored.
-- The job is a full refresh of all POS data, not an incremental load.
-- Duplicate rows, zero or negative quantities and prices, placeholder categories and
-  unknown customer IDs pass through to `sales_conformed` on purpose; the quality gate handles them.
+- Stack 1 (buckets plus Lambda) was applied as an update to an existing stack and the POS
+  result tested in AWS. A first-time create from an empty account follows the same dependency
+  order but has not been verified end to end.
+- The e-commerce and customer pieces (new Lambda triggers, the two hand-written tables, the
+  sales job with e-commerce, the customers job and its schedule) were tested locally against the
+  mock data with PySpark 3.5, the same Spark version as Glue 5.0, and linted with cfn-lint. They
+  have not yet run in AWS, so treat the first deployment as the real test.
+- The landing triggers cover `.csv` under `pos/`, `.json` under `ecommerce/` and `.txt` under
+  `customers/` only.
+- The Lambda requires the exact POS header set by the `PosExpectedHeader` parameter and the
+  exact customer header written in its code. For e-commerce it checks only the first line.
+- The sales job reads only `pos/dt=*/` and `ecommerce/dt=*/` folders, so files in
+  `pos/undated/` are ignored.
+- The sales job is a full refresh of all POS and e-commerce data, not an incremental load.
+- The USD to CAD rate is a fixed parameter, not a live rate.
+- The customers job keeps only the latest snapshot; earlier snapshots stay in raw but are not
+  in the trusted table, so changes over time (for example a customer's province) are not tracked.
+- Duplicate rows (sales, orders and customers), zero or negative quantities and prices,
+  placeholder categories, provinces, names and emails, and unknown customer IDs pass through
+  to the trusted tables on purpose; the quality gate handles them.
 
 ## Team
 

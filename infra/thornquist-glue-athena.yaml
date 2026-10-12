@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Thornquist Outfitters - second stack. Glue database, CSV classifier and crawler
-  for the raw POS data, plus an Athena workgroup with its own results bucket.
+  for the raw POS data, hand-written tables for the raw e-commerce JSON and customer extract, plus an Athena workgroup with its own results bucket.
   Deploy AFTER the buckets stack. Creates NO IAM roles: the crawler uses the
   existing LabRole.
 
@@ -87,6 +87,93 @@ Resources:
       Tags:
         Project: thornquist
 
+  # E-commerce orders are nested JSON (a customer object, an address object and an
+  # array of items), so this table is written by hand instead of crawled. A crawler
+  # would have to guess those shapes. The partition projection settings below make
+  # Athena find the dt= folders by itself, so no crawler run is needed after an upload.
+  RawEcommerceTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref RawDatabase
+      TableInput:
+        Name: raw_ecommerce
+        Description: E-commerce orders exactly as they arrived (JSON lines, one order per line).
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          EXTERNAL: "TRUE"
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: "2026-01-01,NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://thornquist-raw-${Suffix}/ecommerce/dt=${!dt}/"
+        PartitionKeys:
+          - { Name: dt, Type: string }
+        StorageDescriptor:
+          Location: !Sub "s3://thornquist-raw-${Suffix}/ecommerce/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              case.insensitive: "true"
+          Columns:
+            - { Name: orderid, Type: string }
+            - { Name: ordertimestamp, Type: string }
+            - { Name: channel, Type: string }
+            - { Name: currency, Type: string }
+            - { Name: customer, Type: "struct<customerid:bigint,guest:boolean>" }
+            - { Name: shippingaddress, Type: "struct<province:string,country:string>" }
+            - Name: items
+              Type: "array<struct<sku:string,title:string,categorypath:string,qty:int,pricecents:bigint>>"
+
+  # The customer extract is pipe-delimited text with a header line. Like the e-commerce
+  # table it is written by hand (all columns text, nothing guessed) and uses partition
+  # projection, so a new weekly snapshot is queryable as soon as it reaches raw.
+  RawCustomersTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref RawDatabase
+      TableInput:
+        Name: raw_customers
+        Description: Customer extract snapshots exactly as they arrived (pipe-delimited, one snapshot per dt folder).
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: csv
+          EXTERNAL: "TRUE"
+          skip.header.line.count: "1"
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: "2026-01-01,NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://thornquist-raw-${Suffix}/customers/dt=${!dt}/"
+        PartitionKeys:
+          - { Name: dt, Type: string }
+        StorageDescriptor:
+          Location: !Sub "s3://thornquist-raw-${Suffix}/customers/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.serde2.OpenCSVSerde
+            Parameters:
+              separatorChar: "|"
+              quoteChar: '"'
+          Columns:
+            - { Name: cust_no, Type: string }
+            - { Name: first_name, Type: string }
+            - { Name: last_name, Type: string }
+            - { Name: email, Type: string }
+            - { Name: signup_dt, Type: string }
+            - { Name: province, Type: string }
+            - { Name: segment_cd, Type: string }
+            - { Name: opt_in, Type: string }
+
   # --------------------------------------------------------------------- ATHENA
   AthenaResultsBucket:
     Type: AWS::S3::Bucket
@@ -134,6 +221,12 @@ Outputs:
   CrawlerName:
     Description: Start this crawler to create or refresh the raw_pos table.
     Value: !Ref RawPosCrawler
+  EcommerceTableName:
+    Description: Hand-written table for the nested e-commerce JSON. Query it directly in Athena.
+    Value: !Ref RawEcommerceTable
+  CustomersTableName:
+    Description: Hand-written table for the raw customer extract. Query it directly in Athena.
+    Value: !Ref RawCustomersTable
   AthenaWorkGroupName:
     Description: Pick this workgroup in the Athena query editor.
     Value: !Ref AthenaWorkGroup

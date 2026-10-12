@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Thornquist Outfitters - third stack. The raw-to-trusted Glue ETL job for POS data,
-  a bucket for the job's script, and a Glue database plus crawler for the trusted zone.
+  Thornquist Outfitters - third stack. The raw-to-trusted Glue ETL jobs (sales from POS and
+  e-commerce, and the customer extract), a weekly schedule for the customer job, a bucket for
+  the job scripts, and a Glue database plus crawler for the trusted zone.
   Deploy AFTER the buckets stack. Creates NO IAM roles: the job and crawler use LabRole.
 
 Parameters:
@@ -44,10 +45,37 @@ Parameters:
     MaxValue: 120
     Description: The job is stopped after this long, so a stuck run cannot keep spending budget.
 
-  ScriptKey:
+  SalesScriptKey:
     Type: String
-    Default: glue/raw_to_trusted_pos.py
-    Description: Where the script is stored in the scripts bucket. You upload it there after this stack is created.
+    Default: glue/raw_to_trusted_sales.py
+    Description: Where the sales job script is stored in the scripts bucket. You upload it there after this stack is created.
+
+  CustomersScriptKey:
+    Type: String
+    Default: glue/raw_to_trusted_customers.py
+    Description: Where the customer job script is stored in the scripts bucket.
+
+  UsdToCad:
+    Type: String
+    Default: "1.35"
+    AllowedPattern: "^[0-9]{1,2}(\\.[0-9]{1,4})?$"
+    ConstraintDescription: A number such as 1.35
+    Description: >
+      Exchange rate used to convert USD e-commerce orders to CAD. A fixed, documented rate
+      keeps the data reproducible. Change it here and re-run the sales job to apply a new one.
+
+  CustomerSchedule:
+    Type: String
+    Default: "cron(0 6 ? * MON *)"
+    Description: >
+      When the customer job runs (AWS cron, UTC). Default: Mondays at 06:00 UTC, because the
+      customer extract arrives weekly.
+
+  CustomerScheduleEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set to false to create the schedule switched off (for example while the lab is idle).
 
 Resources:
   # ---------------------------------------------------------------- SCRIPT STORE
@@ -77,15 +105,16 @@ Resources:
         - { Key: Purpose, Value: glue-scripts }
 
   # ----------------------------------------------------------------- GLUE JOB
-  RawToTrustedPosJob:
+  RawToTrustedSalesJob:
     Type: AWS::Glue::Job
     Properties:
-      Name: !Sub "thornquist-raw-to-trusted-pos-${Suffix}"
+      Name: !Sub "thornquist-raw-to-trusted-sales-${Suffix}"
       Description: >
-        Reads the raw POS CSVs, conforms them to the shared sales schema (dates, customer ID,
-        SKU, price and quantity types) and writes partitioned Parquet to the trusted bucket.
-        It does not drop or fix bad records; unparseable values become NULL and are listed
-        in the parse_errors column for the data quality gate.
+        Reads the raw POS CSVs and e-commerce JSON orders, conforms them to the shared sales
+        schema (dates, customer ID, SKU, category, price in CAD, one row per item) and writes
+        partitioned Parquet to the trusted bucket. It does not drop or fix bad records;
+        unparseable values become NULL and are listed in the parse_errors column for the
+        data quality gate.
       Role: !Ref LabRoleArn
       GlueVersion: !Ref GlueVersion
       WorkerType: G.1X
@@ -97,7 +126,38 @@ Resources:
       Command:
         Name: glueetl
         PythonVersion: "3"
-        ScriptLocation: !Sub "s3://${ScriptsBucket}/${ScriptKey}"
+        ScriptLocation: !Sub "s3://${ScriptsBucket}/${SalesScriptKey}"
+      DefaultArguments:
+        "--job-language": python
+        "--RAW_BUCKET": !Sub "thornquist-raw-${Suffix}"
+        "--TRUSTED_BUCKET": !Sub "thornquist-trusted-${Suffix}"
+        "--USD_TO_CAD": !Ref UsdToCad
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--job-bookmark-option": job-bookmark-disable
+      Tags:
+        Project: thornquist
+
+  RawToTrustedCustomersJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "thornquist-raw-to-trusted-customers-${Suffix}"
+      Description: >
+        Reads the latest raw customer snapshot (pipe-delimited), converts dates, province
+        names and the opt-in flag, and writes Parquet to the trusted bucket. Runs weekly
+        on a schedule. Duplicates and placeholder values are left for the quality gate.
+      Role: !Ref LabRoleArn
+      GlueVersion: !Ref GlueVersion
+      WorkerType: G.1X
+      NumberOfWorkers: !Ref NumberOfWorkers
+      Timeout: !Ref JobTimeoutMinutes
+      MaxRetries: 0
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ScriptsBucket}/${CustomersScriptKey}"
       DefaultArguments:
         "--job-language": python
         "--RAW_BUCKET": !Sub "thornquist-raw-${Suffix}"
@@ -105,6 +165,21 @@ Resources:
         "--enable-metrics": "true"
         "--enable-continuous-cloudwatch-log": "true"
         "--job-bookmark-option": job-bookmark-disable
+      Tags:
+        Project: thornquist
+
+  # Ingestion mechanism 3: a scheduled batch pull. The customer list is a weekly dump,
+  # so a timer (not a file arrival) starts the job, which then picks up the newest snapshot.
+  CustomersSchedule:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub "thornquist-customers-weekly-${Suffix}"
+      Description: Runs the customer job once a week.
+      Type: SCHEDULED
+      Schedule: !Ref CustomerSchedule
+      StartOnCreation: !Ref CustomerScheduleEnabled
+      Actions:
+        - JobName: !Ref RawToTrustedCustomersJob
       Tags:
         Project: thornquist
 
@@ -117,19 +192,20 @@ Resources:
         Name: !Ref TrustedDatabaseName
         Description: Thornquist trusted zone. Conformed, typed tables.
 
-  # Crawls only sales_conformed/ for now. When the data quality gate starts writing
-  # its passed records to sales/ (and rejected ones to a quarantine folder), add
+  # Crawls sales_conformed/ and customers_conformed/. When the data quality gate starts
+  # writing its passed records to sales/ (and rejected ones to a quarantine folder), add
   # those folders as extra targets here.
   TrustedCrawler:
     Type: AWS::Glue::Crawler
     Properties:
       Name: !Sub "thornquist-trusted-${Suffix}"
-      Description: Registers the conformed sales Parquet as the table sales_conformed, partitioned by dt.
+      Description: Registers the conformed Parquet as the tables sales_conformed (partitioned by dt) and customers_conformed.
       Role: !Ref LabRoleArn
       DatabaseName: !Ref TrustedDatabase
       Targets:
         S3Targets:
           - Path: !Sub "s3://thornquist-trusted-${Suffix}/sales_conformed/"
+          - Path: !Sub "s3://thornquist-trusted-${Suffix}/customers_conformed/"
       SchemaChangePolicy:
         UpdateBehavior: UPDATE_IN_DATABASE
         DeleteBehavior: LOG
@@ -145,11 +221,15 @@ Resources:
 Outputs:
   ScriptsBucketName:
     Value: !Ref ScriptsBucket
-  UploadScriptCommand:
-    Description: Run this from the repo folder to put the job script in place before starting the job.
-    Value: !Sub "aws s3 cp glue/raw_to_trusted_pos.py s3://${ScriptsBucket}/${ScriptKey}"
-  GlueJobName:
-    Value: !Ref RawToTrustedPosJob
+  UploadScriptsCommand:
+    Description: Run this from the repo folder to put both job scripts in place before starting the jobs.
+    Value: !Sub "aws s3 cp glue/raw_to_trusted_sales.py s3://${ScriptsBucket}/${SalesScriptKey} && aws s3 cp glue/raw_to_trusted_customers.py s3://${ScriptsBucket}/${CustomersScriptKey}"
+  SalesJobName:
+    Value: !Ref RawToTrustedSalesJob
+  CustomersJobName:
+    Value: !Ref RawToTrustedCustomersJob
+  CustomersScheduleName:
+    Value: !Ref CustomersSchedule
   TrustedDatabaseName:
     Value: !Ref TrustedDatabase
   TrustedCrawlerName:
