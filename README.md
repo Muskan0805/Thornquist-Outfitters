@@ -25,15 +25,19 @@ An editable copy is in `docs/thornquist-architecture-v1.drawio`.
 | Landing to raw promotion Lambda, with quarantine | Built, tested |
 | Glue database, crawler and Athena workgroup for raw POS | Built, tested |
 | Raw to trusted Glue ETL for POS (schema conformance) | Built, tested |
-| Trusted database and crawler (`sales_conformed`) | Built, tested |
-| E-commerce JSON ingestion (Lambda) and hand-written table definition | Planned |
+| Trusted database and crawler (`thornquist_trusted_david26`) | Built, tested |
+| E-commerce JSON ingestion and table definition | Built, tested (Athena JSON table over S3; no Lambda) |
 | Customer extract ingestion (scheduled Glue job) | Planned |
-| Raw to trusted ETL for e-commerce and customers | Planned |
-| Data quality gate with quarantine | Planned |
-| Curated Parquet table, five Athena queries, dashboard | Planned |
-| Governance package (IAM policy JSON, bucket policy, Lake Formation) | Planned |
+| Raw to trusted ETL for e-commerce and customers | E-commerce built (Athena CTAS); customers planned |
+| Data quality gate with quarantine (rules R1–R5) | Built, tested (252 items quarantined) |
+| Curated table, Athena queries, dashboard | Built (curated output via UNLOAD); dashboard built |
+| Governance package (IAM policy JSON, bucket policy, Lake Formation) | Bucket lockdown applied; Lake Formation not done |
 
-## Repository layout
+## Deliverables
+
+- Pipeline, SQL (`sql/pipeline.sql`), and rebuild runbook (`docs/runbook.md`)
+- Quality rules (`notes/quality-rules.md`) and dashboard screenshots (`docs/`)
+- Presentation: explanation and Q&A, replacing the written report (confirmed by Azeem)
 
 ```
 docs/
