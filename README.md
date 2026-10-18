@@ -40,6 +40,7 @@ An editable copy is in `docs/thornquist-architecture-v2.drawio`.
 - Pipeline, SQL (`sql/pipeline.sql`), and rebuild runbook (`docs/runbook.md`)
 - Quality rules (`notes/quality-rules.md`) and dashboard screenshots (`docs/`)
 - Presentation: explanation and Q&A, replacing the written report (confirmed by Azeem)
+- Dashboard screenshot: [docs/05-dashboard-final.png](docs/05-dashboard-final.png)
 
 ## Repository layout
 
