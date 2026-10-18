@@ -79,6 +79,7 @@ Resources:
       Code:
         ZipFile: |
           import codecs
+          import json
           import logging
           import os
           import urllib.parse
@@ -90,9 +91,24 @@ Resources:
           s3 = boto3.client("s3")
           RAW = os.environ["RAW_BUCKET"]
           EXPECTED = os.environ["EXPECTED_HEADER"].split(",")
+          CUSTOMER_HEADER = "cust_no|first_name|last_name|email|signup_dt|province|segment_cd|opt_in".split("|")
           CHUNK = 65536
           log = logging.getLogger()
           log.setLevel(logging.INFO)
+
+
+          def check_json(text):
+              """E-commerce files are JSON lines: one order per line."""
+              first = next((x for x in text.split("\n") if x.strip()), "")
+              if not first:
+                  return "no data rows"
+              try:
+                  order = json.loads(first)
+              except ValueError:
+                  return "first line is not JSON"
+              if not isinstance(order, dict) or "orderId" not in order or "items" not in order:
+                  return "first line has no orderId or items"
+              return None
 
 
           def check(bucket, key, version):
@@ -111,11 +127,14 @@ Resources:
                   text = dec.decode(body, final=size <= CHUNK)
               except UnicodeDecodeError:
                   return "not valid UTF-8 text"
+              if key.startswith("ecommerce/"):
+                  return check_json(text)
               lines = text.split("\n")
               first = lines[0].strip()
               if not first:
                   return "no header row"
-              if [c.strip() for c in first.split(",")] != EXPECTED:
+              sep, want = ("|", CUSTOMER_HEADER) if key.startswith("customers/") else (",", EXPECTED)
+              if [c.strip() for c in first.split(sep)] != want:
                   return "unexpected header: " + first[:80]
               if not any(x.strip() for x in lines[1:]):
                   return "header only, no data rows"
@@ -141,7 +160,8 @@ Resources:
                       s3.copy_object(
                           CopySource=src, Bucket=RAW, Key="quarantine/" + key,
                           Metadata={"reject-reason": reason},
-                          MetadataDirective="REPLACE", ContentType="text/csv",
+                          MetadataDirective="REPLACE",
+                          ContentType="application/json" if key.endswith(".json") else "text/plain",
                       )
                       log.warning("QUARANTINED  %s  reason: %s", key, problem)
       Tags:
@@ -190,6 +210,20 @@ Resources:
                 Rules:
                   - { Name: prefix, Value: "pos/" }
                   - { Name: suffix, Value: ".csv" }
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt PromoteFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - { Name: prefix, Value: "ecommerce/" }
+                  - { Name: suffix, Value: ".json" }
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt PromoteFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - { Name: prefix, Value: "customers/" }
+                  - { Name: suffix, Value: ".txt" }
       Tags:
         - { Key: Project, Value: thornquist }
         - { Key: Zone, Value: landing }

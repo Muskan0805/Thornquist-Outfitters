@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Upload Thornquist POS daily CSV files into the S3 landing bucket.
+Upload Thornquist source files (POS CSV, e-commerce JSON lines, customer extract) into the S3 landing bucket.
 
 What it does, in plain terms:
-  1. Looks at every .csv file in a local folder.
+  1. Looks at every .csv file (.json with --format json, .txt with --format psv) in a local folder.
   2. Runs a quick sanity check on each one (not empty, has a header, has data rows).
   3. Works out the sales date from the file name (e.g. pos_2026-09-30.csv).
   4. Uploads it to  s3://<bucket>/pos/dt=<date>/<filename>
@@ -15,10 +15,13 @@ cleaning happens later in the pipeline.
 Example:
   python pos_upload.py --bucket thornquist-landing-mk --source-dir ./pos_data
   python pos_upload.py --bucket thornquist-landing-mk --source-dir ./pos_data --dry-run
+  python pos_upload.py --bucket thornquist-landing-mk --source-dir ./ecommerce --format json
+  python pos_upload.py --bucket thornquist-landing-mk --source-dir ./customers --format psv
 """
 
 import argparse
 import csv
+import json
 import logging
 import re
 import sys
@@ -52,7 +55,7 @@ def extract_date(filename):
     return None
 
 
-def check_csv(path):
+def check_csv(path, delimiter=","):
     """Cheap arrival check. Returns an error message, or None if the file looks fine.
 
     This is NOT the data quality gate. It only catches files that are clearly
@@ -63,14 +66,33 @@ def check_csv(path):
     try:
         # utf-8-sig quietly handles the BOM that Excel adds to exported CSVs.
         with path.open("r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.reader(f)
+            reader = csv.reader(f, delimiter=delimiter)
             header = next(reader, None)
             if not header or not any(cell.strip() for cell in header):
                 return "no header row"
+            if delimiter != "," and len(header) < 2:
+                return "header does not use the %r delimiter" % delimiter
             if next(reader, None) is None:
                 return "header only, no data rows"
     except (UnicodeDecodeError, csv.Error) as exc:
         return f"cannot be read as CSV ({exc})"
+    return None
+
+
+def check_json_lines(path):
+    """Same idea for e-commerce files: one JSON order per line. Returns an error or None."""
+    if path.stat().st_size == 0:
+        return "file is empty"
+    try:
+        with path.open("r", encoding="utf-8-sig") as f:
+            first = next((line for line in f if line.strip()), "")
+        if not first:
+            return "no data rows"
+        order = json.loads(first)
+    except (UnicodeDecodeError, ValueError):
+        return "first line is not valid JSON"
+    if not isinstance(order, dict) or "orderId" not in order or "items" not in order:
+        return "first line has no orderId or items"
     return None
 
 
@@ -101,7 +123,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Upload POS CSV files to the S3 landing bucket.")
     parser.add_argument("--bucket", required=True, help="Landing bucket name, e.g. thornquist-landing-mk")
     parser.add_argument("--source-dir", required=True, help="Local folder containing the POS CSV files")
-    parser.add_argument("--prefix", default="pos", help="Top-level folder in the bucket (default: pos)")
+    parser.add_argument("--format", choices=["csv", "json", "psv"], default="csv",
+                        help="csv = POS files (default). json = e-commerce JSON lines. psv = pipe-delimited customer extract")
+    parser.add_argument("--prefix", default=None,
+                        help="Top-level folder in the bucket (default: pos, ecommerce or customers)")
     parser.add_argument("--region", default=None, help="AWS region (default: from your AWS config)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen without uploading")
     return parser.parse_args()
@@ -111,14 +136,21 @@ def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    ext, check, ctype, default_prefix = {
+        "csv": (".csv", check_csv, "text/csv", "pos"),
+        "json": (".json", check_json_lines, "application/json", "ecommerce"),
+        "psv": (".txt", lambda path: check_csv(path, "|"), "text/plain", "customers"),
+    }[args.format]
+    prefix = args.prefix or default_prefix
+
     source_dir = Path(args.source_dir)
     if not source_dir.is_dir():
         log.error("Source folder not found: %s", source_dir)
         return 1
 
-    files = sorted(p for p in source_dir.iterdir() if p.is_file() and p.suffix.lower() == ".csv")
+    files = sorted(p for p in source_dir.iterdir() if p.is_file() and p.suffix.lower() == ext)
     if not files:
-        log.error("No .csv files found in %s", source_dir)
+        log.error("No %s files found in %s", ext, source_dir)
         return 1
 
     s3 = boto3.client("s3", region_name=args.region)
@@ -135,13 +167,13 @@ def main():
     counts = {"uploaded": 0, "skipped": 0, "rejected": 0, "failed": 0}
 
     for path in files:
-        problem = check_csv(path)
+        problem = check(path)
         if problem:
             log.warning("REJECTED %s: %s", path.name, problem)
             counts["rejected"] += 1
             continue
 
-        key, date = build_key(args.prefix, path.name)
+        key, date = build_key(prefix, path.name)
         if date is None:
             log.warning("No date found in '%s'; it will go to %s", path.name, key)
 
@@ -158,7 +190,7 @@ def main():
 
             s3.upload_file(
                 str(path), args.bucket, key,
-                ExtraArgs={"ContentType": "text/csv"},
+                ExtraArgs={"ContentType": ctype},
             )
             log.info("UPLOADED %s -> s3://%s/%s", path.name, args.bucket, key)
             counts["uploaded"] += 1
