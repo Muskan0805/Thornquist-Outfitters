@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyQuarantineReadExceptPipelineRole",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::thornquist-curated-david26/quarantine/*",
+      "Condition": {"StringNotEquals": {"aws:PrincipalArn": "arn:aws:iam::928679333963:role/LabRole"}}
+    },
+    {
+      "Sid": "DenyUpstreamZoneAccessExceptPipelineRole",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": [
+        "arn:aws:s3:::thornquist-landing-david26/*",
+        "arn:aws:s3:::thornquist-raw-david26/*"
+      ],
+      "Condition": {"StringNotEquals": {"aws:PrincipalArn": "arn:aws:iam::928679333963:role/LabRole"}}
+    }
+  ]
+}

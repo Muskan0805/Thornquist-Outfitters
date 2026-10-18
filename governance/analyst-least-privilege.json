@@ -1,0 +1,50 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AthenaQueryInWorkgroupOnly",
+      "Effect": "Allow",
+      "Action": ["athena:StartQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults", "athena:StopQueryExecution", "athena:GetWorkGroup"],
+      "Resource": "arn:aws:athena:us-east-1:928679333963:workgroup/thornquist-david26"
+    },
+    {
+      "Sid": "GlueReadCuratedTableOnly",
+      "Effect": "Allow",
+      "Action": ["glue:GetDatabase", "glue:GetTable", "glue:GetTables", "glue:GetPartitions", "glue:GetPartition"],
+      "Resource": [
+        "arn:aws:glue:us-east-1:928679333963:catalog",
+        "arn:aws:glue:us-east-1:928679333963:database/thornquist_trusted_david26",
+        "arn:aws:glue:us-east-1:928679333963:table/thornquist_trusted_david26/curated_all"
+      ]
+    },
+    {
+      "Sid": "ReadCuratedDataOnly",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::thornquist-curated-david26/sales_clean/*"
+    },
+    {
+      "Sid": "ListCuratedPrefixOnly",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::thornquist-curated-david26",
+      "Condition": {"StringLike": {"s3:prefix": ["sales_clean/*"]}}
+    },
+    {
+      "Sid": "AthenaResultsBucketOnly",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:GetBucketLocation"],
+      "Resource": ["arn:aws:s3:::thornquist-athena-results-david26", "arn:aws:s3:::thornquist-athena-results-david26/*"]
+    },
+    {
+      "Sid": "ExplicitDenyUpstreamZones",
+      "Effect": "Deny",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::thornquist-landing-david26", "arn:aws:s3:::thornquist-landing-david26/*",
+        "arn:aws:s3:::thornquist-raw-david26", "arn:aws:s3:::thornquist-raw-david26/*",
+        "arn:aws:s3:::thornquist-trusted-david26", "arn:aws:s3:::thornquist-trusted-david26/*"
+      ]
+    }
+  ]
+}
