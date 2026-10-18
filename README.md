@@ -8,7 +8,7 @@ personal data is used anywhere.
 
 ## Architecture
 
-![Architecture v2](docs/thornquist-architecture-v2.png)
+![Architecture v2](docs/architecture-v2.png)
 
 Flow: three sources, three ingestion mechanisms (a script, an S3-triggered Lambda and a
 scheduled Glue job), S3 landing, a validation Lambda, S3 raw, Glue ETL jobs that conform
