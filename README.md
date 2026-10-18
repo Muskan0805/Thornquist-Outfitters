@@ -25,14 +25,21 @@ An editable copy is in `docs/thornquist-architecture-v2.drawio`.
 | Scripted POS upload to landing | Built, tested |
 | Landing to raw promotion Lambda (POS, e-commerce, customers), with quarantine | Built, tested |
 | Glue database, crawler and Athena workgroup for raw POS | Built, tested |
+| Raw to trusted Glue ETL for POS (schema conformance) | Built, tested |
+| Trusted database and crawler (`thornquist_trusted_david26`) | Built, tested |
 | E-commerce ingestion: Lambda trigger plus hand-written `raw_ecommerce` table (nested JSON) | Built, tested locally; deploy to confirm |
 | Customer extract ingestion: hand-written `raw_customers` table plus weekly scheduled Glue job | Built, tested locally; deploy to confirm |
 | Raw to trusted Glue ETL for sales (POS and e-commerce, `sales_conformed`) | POS built and run in AWS; e-commerce tested locally |
 | Raw to trusted Glue ETL for customers (`customers_conformed`) | Built, tested locally; deploy to confirm |
-| Trusted database and crawler | Built, tested |
-| Data quality gate with quarantine | Planned |
-| Curated Parquet table, five Athena queries, dashboard | Planned |
-| Governance package (IAM policy JSON, bucket policy, Lake Formation) | Planned |
+| Data quality gate with quarantine (rules R1–R5) | Built, tested (252 items quarantined) |
+| Curated table, Athena queries, dashboard | Built (curated output via UNLOAD); dashboard built |
+| Governance package (IAM policy JSON, bucket policy, Lake Formation permission list) | Committed; bucket lockdown applied; Lake Formation documented as AccessDenied in lab |
+
+## Deliverables
+
+- Pipeline, SQL (`sql/pipeline.sql`), and rebuild runbook (`docs/runbook.md`)
+- Quality rules (`notes/quality-rules.md`) and dashboard screenshots (`docs/`)
+- Presentation: explanation and Q&A, replacing the written report (confirmed by Azeem)
 
 ## Repository layout
 
