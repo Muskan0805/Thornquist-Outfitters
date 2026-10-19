@@ -5,6 +5,9 @@ Upload Thornquist source files (POS CSV, e-commerce JSON lines, customer extract
 What it does, in plain terms:
   1. Looks at every .csv file (.json with --format json, .txt with --format psv) in a local folder.
   2. Runs a quick sanity check on each one (not empty, has a header, has data rows).
+     A file that fails the check is logged as FLAGGED but is STILL uploaded: landing keeps
+     everything exactly as it was sent, and the landing-to-raw Lambda is the gate that moves
+     a bad file to quarantine/ with the reason attached.
   3. Works out the sales date from the file name (e.g. pos_2026-09-30.csv).
   4. Uploads it to  s3://<bucket>/pos/dt=<date>/<filename>
   5. Skips files that are already there with the same size, so re-running is safe.
@@ -164,14 +167,15 @@ def main():
                   "(they expire when the session ends).")
         return 1
 
-    counts = {"uploaded": 0, "skipped": 0, "rejected": 0, "failed": 0}
+    counts = {"uploaded": 0, "skipped": 0, "flagged": 0, "failed": 0}
 
     for path in files:
+        # Never drop a file here. A broken file is flagged in the log and uploaded anyway,
+        # so landing holds everything that was sent and the Lambda quarantines it with a reason.
         problem = check(path)
         if problem:
-            log.warning("REJECTED %s: %s", path.name, problem)
-            counts["rejected"] += 1
-            continue
+            log.warning("FLAGGED  %s: %s (uploading anyway; the Lambda will quarantine it)", path.name, problem)
+            counts["flagged"] += 1
 
         key, date = build_key(prefix, path.name)
         if date is None:
@@ -199,8 +203,8 @@ def main():
             counts["failed"] += 1
 
     label = "would upload" if args.dry_run else "uploaded"
-    log.info("Done. %s: %d | skipped: %d | rejected: %d | failed: %d",
-             label, counts["uploaded"], counts["skipped"], counts["rejected"], counts["failed"])
+    log.info("Done. %s: %d | skipped: %d | flagged: %d | failed: %d",
+             label, counts["uploaded"], counts["skipped"], counts["flagged"], counts["failed"])
 
     # A non-zero exit code lets a scheduler or CI job notice that something went wrong.
     return 1 if counts["failed"] else 0
