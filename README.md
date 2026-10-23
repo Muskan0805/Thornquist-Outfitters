@@ -8,14 +8,13 @@ personal data is used anywhere.
 
 ## Architecture
 
-![Architecture v2](docs/architecture-v2.png)
+![Architecture](docs/thornquist-architecture.png)
 
-Flow: three sources, three ingestion mechanisms (a script, an S3-triggered Lambda and a
-scheduled Glue job), S3 landing, a validation Lambda, S3 raw, Glue ETL jobs that conform
-the schema, S3 trusted, a data quality gate, a Glue ETL job that aggregates, S3 curated
+Flow: three sources, one upload script (`pos_upload.py`) that sends all three into S3 landing,
+a validation Lambda that checks every file, S3 raw, Glue ETL jobs (sales on demand, customers
+weekly) that conform the schema, S3 trusted, a data quality gate, a Glue ETL job that aggregates, S3 curated
 (Parquet), then Athena and a dashboard. Glue crawlers and hand-written tables register
 the zones in the Glue Data Catalog. Solid boxes in the diagram are built and tested; dashed boxes are planned.
-An editable copy is in `docs/thornquist-architecture-v2.drawio`.
 
 ## Status
 
@@ -27,10 +26,10 @@ An editable copy is in `docs/thornquist-architecture-v2.drawio`.
 | Glue database, crawler and Athena workgroup for raw POS | Built, tested |
 | Raw to trusted Glue ETL for POS (schema conformance) | Built, tested |
 | Trusted database and crawler (`thornquist_trusted_david26`) | Built, tested |
-| E-commerce ingestion: Lambda trigger plus hand-written `raw_ecommerce` table (nested JSON) | Built, tested locally; deploy to confirm |
-| Customer extract ingestion: hand-written `raw_customers` table plus weekly scheduled Glue job | Built, tested locally; deploy to confirm |
-| Raw to trusted Glue ETL for sales (POS and e-commerce, `sales_conformed`) | POS built and run in AWS; e-commerce tested locally |
-| Raw to trusted Glue ETL for customers (`customers_conformed`) | Built, tested locally; deploy to confirm |
+| E-commerce ingestion: Lambda trigger plus hand-written `raw_ecommerce` table (nested JSON) | Built, tested in AWS |
+| Customer extract ingestion: hand-written `raw_customers` table, uploaded with `pos_upload.py --format psv`, converted by a weekly scheduled Glue job | Built, tested in AWS |
+| Raw to trusted Glue ETL for sales (POS and e-commerce, `sales_conformed`) | Built, tested in AWS |
+| Raw to trusted Glue ETL for customers (`customers_conformed`) | Built, tested in AWS |
 | Data quality gate with quarantine (rules R1–R5) | Built, tested (252 items quarantined) |
 | Curated table, Athena queries, dashboard | Built (curated output via UNLOAD); dashboard built |
 | Governance package (IAM policy JSON, bucket policy, Lake Formation permission list) | Committed; bucket lockdown applied; Lake Formation documented as AccessDenied in lab |
@@ -46,7 +45,7 @@ An editable copy is in `docs/thornquist-architecture-v2.drawio`.
 
 ```
 docs/
-  thornquist-architecture-v2.png     Architecture diagram (also .svg and editable .drawio)
+  thornquist-architecture.png        Architecture diagram
 infra/
   thornquist-buckets.yaml            Stack 1: four zone buckets + landing-to-raw Lambda and its triggers
   thornquist-glue-athena.yaml        Stack 2: Glue database, raw POS crawler, raw e-commerce and customer tables, Athena workgroup
@@ -56,7 +55,7 @@ glue/
   raw_to_trusted_customers.py        PySpark job: latest raw customer snapshot to conformed customers Parquet
 scripts/
   generate_mock_data.py              Creates the synthetic POS, e-commerce and customer files
-  pos_upload.py                      Uploads files to landing: POS CSV (default), e-commerce JSON (--format json), customer extract (--format psv)
+  pos_upload.py                      Uploads every file to landing, flagging broken ones in the log: POS CSV (default), e-commerce JSON (--format json), customer extract (--format psv)
 ```
 
 ## Zone design and promotion rules
@@ -166,20 +165,16 @@ python3 scripts/pos_upload.py --bucket thornquist-landing-<suffix> --source-dir 
 ```
 
 The generator is seeded, so everyone gets identical files. `mock_data/_INJECTED_ISSUES.txt`
-lists every deliberate data problem and the exact count. The upload script rejects
-the two intentionally broken POS files locally. To see the Lambda quarantine them,
-upload them directly:
-
-```
-aws s3 cp mock_data/pos/pos_2026-10-01.csv s3://thornquist-landing-<suffix>/pos/dt=2026-10-01/pos_2026-10-01.csv
-aws s3 cp mock_data/pos/pos_2026-10-02.csv s3://thornquist-landing-<suffix>/pos/dt=2026-10-02/pos_2026-10-02.csv
-```
+lists every deliberate data problem and the exact count. The upload script checks each
+file and logs a FLAGGED warning for the two intentionally broken POS files, but it still
+uploads them. Landing keeps everything exactly as it was sent, and the Lambda is the gate
+that quarantines them. A POS run ends with `uploaded: 16 | skipped: 0 | flagged: 2 | failed: 0`.
 
 ### 3. Check promotion
 
 After about 30 seconds, `thornquist-raw-<suffix>` should hold `pos/` (14 dated folders),
 `ecommerce/` (14 dated folders) and `customers/` (2 dated folders), and `quarantine/pos/`
-should hold the 2 rejected files. Logs are in CloudWatch under
+should hold the 2 broken files (the empty one and the header-only one), each with its `reject-reason`. Logs are in CloudWatch under
 `/aws/lambda/thornquist-landing-to-raw-<suffix>`.
 
 ### 4. Deploy stack 2 (catalog and Athena)
@@ -267,10 +262,9 @@ to reconcile:
 - Stack 1 (buckets plus Lambda) was applied as an update to an existing stack and the POS
   result tested in AWS. A first-time create from an empty account follows the same dependency
   order but has not been verified end to end.
-- The e-commerce and customer pieces (new Lambda triggers, the two hand-written tables, the
-  sales job with e-commerce, the customers job and its schedule) were tested locally against the
-  mock data with PySpark 3.5, the same Spark version as Glue 5.0, and linted with cfn-lint. They
-  have not yet run in AWS, so treat the first deployment as the real test.
+- The e-commerce and customer pieces (Lambda triggers, the two hand-written tables, the sales job
+  with e-commerce, the customers job and its schedule) were tested locally with PySpark 3.5, the
+  same Spark version as Glue 5.0, and then deployed and verified in AWS with Athena.
 - The landing triggers cover `.csv` under `pos/`, `.json` under `ecommerce/` and `.txt` under
   `customers/` only.
 - The Lambda requires the exact POS header set by the `PosExpectedHeader` parameter and the
